@@ -1,0 +1,1381 @@
+# IMPORTANT :
+#   1. Ce fichier doit etre place dans .github/workflows/ (ex : .github/workflows/windows-rdp.yml)
+#      sur la BRANCHE PAR DEFAUT du depot (sinon "Run workflow" n'apparait pas).
+#   2. Encodage UTF-8 sans BOM, indentation par ESPACES uniquement (aucune tabulation).
+#   3. Un ':' final dans une valeur YAML (ex : un nom de step finissant par "J:")
+#      doit rester entre guillemets, sinon le YAML est invalide
+#      ("mapping values are not allowed here" -> refus du workflow par GitHub).
+name: Windows Server 2022 - RDP via Tailscale (securise)
+
+on:
+  workflow_dispatch:
+
+# Bonne pratique : le checkout n'a besoin que de lire le depot. L'auto-relance
+# utilise le PAT (secret GH_PAT), qui n'est pas limite par ce bloc.
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350   # max GitHub = 360 min
+
+    steps:
+      - name: Checkout (pour recuperer scripts/Downloads.bat du depot)
+        uses: actions/checkout@v4
+
+      - name: Configure RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          # NLA laisse ACTIF (plus sur). Si votre client RDP ne supporte pas NLA,
+          # decommentez les 2 lignes suivantes :
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          #   -Name "UserAuthentication" -Value 0 -Force
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          #   -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          # NOUVEAU : acces Jellyfin (interface web port 8096) depuis le tailnet
+          netsh advfirewall firewall delete rule name="Jellyfin-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="Jellyfin-Tailscale" `
+            dir=in action=allow protocol=TCP localport=8096
+          # NOUVEAU : elevation UAC automatique sans boite de dialogue.
+          # Utile pour les installateurs lances depuis Downloads.bat dans la
+          # session RDP (ex: NDM) : ils s'installent sans demander de clic.
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+            -Name "ConsentPromptBehaviorAdmin" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+            -Name "PromptOnSecureDesktop" -Value 0 -Force
+          Restart-Service -Name TermService -Force
+      - name: Create RDP user (mot de passe en secret, jamais affiche)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($Env:RDP_PASSWORD)) {
+            Write-Error "Secret RDP_PASSWORD manquant. Creez-le dans Settings > Secrets > Actions."
+            exit 1
+          }
+          $securePass = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Write-Host "Utilisateur 'RDP' cree. Mot de passe masque."
+      # ================================================================
+      # NOUVEAU : WinFSP + Rclone + attachement des comptes MEGA
+      # TOUS les comptes dans UN SEUL secret : MEGA_ACCOUNTS (JSON)
+      # Regroupes dans UN SEUL disque combine (backend combine rclone)
+      # ================================================================
+      - name: Install WinFSP + Rclone, attache les comptes MEGA (disque combine unique)
+        env:
+          # UN SEUL secret pour TOUS les comptes MEGA, au format JSON.
+          # Valeur a mettre dans le secret MEGA_ACCOUNTS
+          # (Settings > Secrets and variables > Actions > New repository secret) :
+          #   [
+          #     { "user": "compte1@example.com", "pass": "MotDePasse1" },
+          #     { "user": "compte2@example.com", "pass": "MotDePasse2" }
+          #   ]
+          # => remotes individuels mega:, mega2:, mega3:... verifies puis
+          #    regroupes dans UN SEUL remote combine MEGA_MULTI:.
+          #    Downloads.bat ne monte plus qu'UN SEUL disque :
+          #    M: = \\rclone\mega, avec un sous-dossier par compte
+          #    (nom derive de l'email, ex: hannahemma_huggsfeld_store).
+          #    Plus aucune limite de lettres de lecteurs (fini M: -> Z:).
+          MEGA_ACCOUNTS: ${{ secrets.MEGA_ACCOUNTS }}
+        run: |
+          # ---------- WinFSP (requis par 'rclone mount' sur Windows) ----------
+          # Le nom de l'asset MSI est versionne, on le recupere via l'API GitHub
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/winfsp/winfsp/releases/latest" `
+                   -Headers @{ "User-Agent" = "gh-actions" }
+          $msiUrl = ($rel.assets | Where-Object { $_.name -match '\.msi$' } | Select-Object -First 1).browser_download_url
+          Write-Host "WinFSP detecte : $msiUrl"
+          $msi = "$env:TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri $msiUrl -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait
+          Remove-Item $msi -Force
+          Write-Host "WinFSP installe."
+          # ---------- Rclone ----------
+          $zip = "$env:TEMP\rclone.zip"
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\rclone-x" -Force
+          New-Item -ItemType Directory -Path "C:\rclone" -Force | Out-Null
+          Copy-Item "$env:TEMP\rclone-x\*\rclone.exe" -Destination "C:\rclone\" -Force
+          Remove-Item $zip -Force
+          Remove-Item "$env:TEMP\rclone-x" -Recurse -Force
+          # Rclone ajoute au PATH machine + fichier de config partage
+          # (RCLONE_CONFIG machine => visible aussi dans la session RDP)
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($machinePath -notlike "*C:\rclone*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;C:\rclone", "Machine")
+          }
+          [Environment]::SetEnvironmentVariable("RCLONE_CONFIG", "C:\rclone\rclone.conf", "Machine")
+          $env:RCLONE_CONFIG = "C:\rclone\rclone.conf"
+          $env:Path += ";C:\rclone"
+          $rclone = "C:\rclone\rclone.exe"
+          Write-Host "Rclone installe : $(& $rclone version | Select-Object -First 1)"
+          # ---------- Attacher les comptes MEGA : UN SEUL secret (MEGA_ACCOUNTS) ----------
+          # NB : la 2FA doit etre DESACTIVEE sur chaque compte MEGA, sinon
+          # rclone ne peut pas repondre au code 2FA en mode automatise.
+          if ([string]::IsNullOrWhiteSpace($Env:MEGA_ACCOUNTS)) {
+            Write-Error "Secret MEGA_ACCOUNTS manquant. Creez-le dans Settings > Secrets and variables > Actions : tableau JSON des comptes [{ user, pass }, ...]."
+            exit 1
+          }
+          try {
+            $accounts = @($Env:MEGA_ACCOUNTS | ConvertFrom-Json)
+          } catch {
+            Write-Error "Secret MEGA_ACCOUNTS : JSON invalide ($($_.Exception.Message))."
+            exit 1
+          }
+          $accounts = @($accounts | Where-Object { $_.user -and $_.pass })
+          if ($accounts.Count -eq 0) {
+            Write-Error "Secret MEGA_ACCOUNTS vide ou mal forme : tableau JSON d'objets { user, pass } attendu."
+            exit 1
+          }
+          # ---------- Remotes individuels : un par compte, verifies ----------
+          $upstreams = @()
+          $dirs = @{}
+          $idx = 0
+          foreach ($a in $accounts) {
+            $idx++
+            # remote individuel du compte : mega, mega2, mega3...
+            $remote = "mega"
+            if ($idx -gt 1) { $remote = "mega$idx" }
+            # nom du sous-dossier dans le disque combine : derive de l'email
+            # (hannahemma@huggsfeld.store -> hannahemma_huggsfeld_store)
+            $dir = ($a.user -replace '[^a-zA-Z0-9]', '_')
+            if ($dirs.ContainsKey($dir)) { $dir = "${dir}_$idx" }
+            $dirs[$dir] = $true
+            $obscured = & $rclone obscure "$($a.pass)"
+            & $rclone config create $remote mega "user=$($a.user)" "pass=$obscured"
+            $ok = $false
+            foreach ($t in 1..3) {
+              & $rclone about "${remote}:" | Out-Null
+              if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+              Write-Host "Connexion MEGA #$idx en cours... essai $t/3"
+              Start-Sleep -Seconds 10
+            }
+            if (-not $ok) {
+              Write-Host "AVERTISSEMENT : connexion MEGA #$idx ($($a.user)) echouee. Compte ignore."
+              continue
+            }
+            Write-Host "Compte MEGA #$idx attache : '$dir' -> remote '${remote}:'"
+            $upstreams += "$dir=${remote}:"
+          }
+          if ($upstreams.Count -eq 0) {
+            Write-Error "Aucun compte MEGA connecte. Verifiez les identifiants dans MEGA_ACCOUNTS et desactivez la 2FA."
+            exit 1
+          }
+          # ---------- Remote combine : UN SEUL disque pour tous les comptes ----------
+          # Backend 'combine' : chaque upstream est 'dossier=remote:' ; le disque
+          # monte montrera un sous-dossier par compte MEGA. Downloads.bat ne
+          # monte plus qu'UN SEUL disque : MEGA_MULTI: -> M: (\\rclone\mega).
+          & $rclone config create MEGA_MULTI combine ("upstreams=" + ($upstreams -join ' '))
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Creation du remote combine MEGA_MULTI echouee."
+            exit 1
+          }
+          Write-Host "Remote combine pret : MEGA_MULTI: ($($upstreams.Count) compte(s))."
+          Write-Host "Un seul disque sera monte par Downloads.bat : M: = \\rclone\mega"
+      # ================================================================
+      # NOUVEAU : Attacher le compte MEGA dedie pour Jellyfin Config
+      # ================================================================
+      - name: Attacher le compte MEGA dédié pour Jellyfin Config
+        env:
+          MEGA_CONFIG: ${{ secrets.MEGA_CONFIG_ACCOUNT }}
+        run: |
+          # Garde-fou : sans ce test, ConvertFrom-Json sur une valeur vide
+          # produit une erreur illisible et masque la vraie cause.
+          if ([string]::IsNullOrWhiteSpace($Env:MEGA_CONFIG)) {
+            Write-Error "Secret MEGA_CONFIG_ACCOUNT manquant : creez-le en JSON { \"user\": ..., \"pass\": ... }."
+            exit 1
+          }
+          try {
+            $account = $Env:MEGA_CONFIG | ConvertFrom-Json
+          } catch {
+            Write-Error "Secret MEGA_CONFIG_ACCOUNT : JSON invalide ($($_.Exception.Message))."
+            exit 1
+          }
+          $rclone = "C:\rclone\rclone.exe"
+          $pass = & $rclone obscure $account.pass
+          & $rclone config create mega-config mega "user=$($account.user)" "pass=$pass"
+          # ------------------------------------------------------------------
+          # NOUVELLE ARCHITECTURE (remplace le montage J: en service NSSM) :
+          # Jellyfin n'accede PLUS directement au cloud. Le service Jellyfin
+          # (NetworkService) ecrivait sa config/SQLite a travers le montage
+          # rclone/WinFSP/MEGA : fragile (refus d'ecriture sur certains
+          # fichiers, SQLite sur montage cloud = risque de corruption,
+          # ecritures perdues si la VM est tuee par le timeout).
+          # Desormais :
+          #   - la config Jellyfin reste sur le disque LOCAL (rapide, fiable) ;
+          #   - MEGA sert de sauvegarde : restauration APRES le demarrage de
+          #     Windows (tache planifiee + script .bat/.ps1) et copie periodique
+          #     vers mega-config:JellyfinConfig (JellyfinConfigBackup).
+          # Aucun montage J: n'est necessaire : on verifie seulement l'acces
+          # au backend MEGA (rclone lsf, independant des sessions Windows).
+          # ------------------------------------------------------------------
+          & $rclone lsf mega-config: --max-depth 1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error "Acces au compte MEGA (mega-config) impossible : verifiez identifiants et 2FA desactivee."; exit 1 }
+          Write-Host "Compte MEGA de sauvegarde 'mega-config' pret (backend accessible)."
+      # ================================================================
+      # NOUVEAU : MEGAsync (client graphique de synchro MEGA)
+      # ================================================================
+      - name: Install MEGAsync (machine-wide, silencieux)
+        run: |
+          $exe = "$env:TEMP\MEGAsyncSetup64.exe"
+          Invoke-WebRequest -Uri "https://mega.nz/MEGAsyncSetup64.exe" -OutFile $exe
+          # /S = silencieux ; /MULTIUSER=true = installe pour tous les utilisateurs
+          # (l'ancien switch /AllUsers ne fonctionne plus avec les versions recentes)
+          Start-Process $exe -ArgumentList "/S", "/MULTIUSER=true" -Wait
+          Remove-Item $exe -Force
+          if (Test-Path "$env:ProgramFiles\MEGAsync\MEGAsync.exe") {
+            Write-Host "MEGAsync installe dans Program Files."
+            Write-Host "Le login du compte MEGA se fera dans l'assistant graphique a la 1re session RDP."
+          } else {
+            Write-Host "AVERTISSEMENT : MEGAsync.exe introuvable apres installation, a verifier."
+          }
+      # ================================================================
+      # NOUVEAU : Jellyfin Server (installe en service Windows, port 8096)
+      # ================================================================
+      - name: Install Jellyfin Server
+        run: |
+          # Derniere version stable publiee sur repo.jellyfin.org (pas besoin d'API GitHub)
+          $listing = (Invoke-WebRequest -UseBasicParsing "https://repo.jellyfin.org/files/server/windows/latest-stable/amd64/").Content
+          $exeName = [regex]::Match($listing, 'jellyfin_[0-9\.]+_windows-x64\.exe').Value
+          if (-not $exeName) { Write-Error "Impossible de trouver l'installeur Jellyfin."; exit 1 }
+          Write-Host "Jellyfin detecte : $exeName"
+          $installer = "$env:TEMP\$exeName"
+          Invoke-WebRequest -Uri "https://repo.jellyfin.org/files/server/windows/latest-stable/amd64/$exeName" -OutFile $installer
+          # /S = installation silencieuse NSIS : installe aussi le service Windows
+          # (chemins par defaut : C:\Program Files\Jellyfin\Server et C:\ProgramData\Jellyfin\Server)
+          Start-Process $installer -ArgumentList "/S" -Wait
+          Remove-Item $installer -Force
+          # Attendre que le service Jellyfin soit demarre
+          $svcUp = $false
+          foreach ($i in 1..24) {
+            $svc = Get-Service | Where-Object { $_.Name -like "*Jellyfin*" -or $_.DisplayName -like "*Jellyfin*" }
+            if ($svc -and $svc.Status -eq "Running") { $svcUp = $true; break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $svcUp) {
+            Write-Host "Service non detecte, demarrage direct de jellyfin.exe en secours..."
+            $jf = Get-ChildItem "C:\Program Files\Jellyfin" -Recurse -Filter "jellyfin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($jf) { Start-Process $jf.FullName }
+            else { Write-Error "Jellyfin introuvable apres installation."; exit 1 }
+          }
+          # Verifier que le port web 8096 repond
+          foreach ($i in 1..24) {
+            $r = Test-NetConnection -ComputerName localhost -Port 8096 -WarningAction SilentlyContinue
+            if ($r.TcpTestSucceeded) { break }
+            Start-Sleep -Seconds 5
+          }
+          Write-Host "Jellyfin pret : interface web sur le port 8096."
+          Write-Host "Premiere connexion : suivre l'assistant de configuration sur http://localhost:8096"
+      # ================================================================
+      # NOUVEAU : Scripts Jellyfin - la restauration se fait APRES le
+      # demarrage de Windows (plus DANS le job) : script .ps1/.bat lance
+      # par la tache planifiee "RestaurationJellyfinMEGA", relancable a
+      # la main via RestaurerJellyfinMEGA.bat sur le Bureau. La
+      # sauvegarde periodique (jellyfin-sync.ps1, v2) n ecrase JAMAIS une
+      # sauvegarde MEGA existante : elle attend le flag de restauration,
+      # ou s auto-active sur premiere installation (aucune sauvegarde sur
+      # MEGA + Jellyfin operationnel + assistant termine = rien a ecraser).
+      # ================================================================
+      - name: Deployer les scripts Jellyfin (restauration planifiee au demarrage de Windows + sauvegarde periodique)
+        run: |
+          New-Item -ItemType Directory -Path 'C:\rclone' -Force | Out-Null
+
+          # ---------- 1) RestaurerJellyfinMEGA.ps1 (contenu a la colonne 0) ----------
+          $restorePs1 = @'
+          # =====================================================================
+          # RestaurerJellyfinMEGA.ps1  (VERSION 3.0 - 2026-11-17)
+          # Restaure la configuration Jellyfin depuis la sauvegarde MEGA.
+          #
+          # Deux sources possibles, dans cet ordre :
+          #   1. SOURCE ZIP NATIF (nouvelle strategie v3.0) : dernier
+          #      jellyfin-backup-AAAAMMJJHHMMSS.zip sur mega-config:JellyfinBackups.
+          #      Backup integre de Jellyfin 10.11+ (Dashboard -> Backups), deja
+          #      COHERENT (produit par Jellyfin lui-meme). Restauration OFFICIELLE
+          #      : jellyfin.exe --restore-archive <zip> : c est Jellyfin qui
+          #      extrait le zip (base, config, metadata...), aucune copie
+          #      manuelle, le format interne du zip est propre a Jellyfin.
+          #      NB (GitHub #17449) : --restore-archive echoue sur une base
+          #      JAMAIS initialisee ("no such table") : ce script verifie donc
+          #      que jellyfin.db existe (Jellyfin a demarre au moins une fois)
+          #      avant de lancer la restauration.
+          #   2. SOURCE ANCIENNE (repli) : dossiers config/+data/ sur
+          #      mega-config:JellyfinConfig/Server (format des scripts v2.x).
+          #      Ces dossiers ne sont PLUS alimentes depuis la v3.0, mais ils
+          #      restent utilisables si aucun zip n est disponible ou si la
+          #      restauration zip echoue.
+          #
+          # Deux modes d execution :
+          #   - AUTOMATIQUE : tache planifiee "RestaurationJellyfinMEGA" (SYSTEM)
+          #     au demarrage de Windows et a l ouverture de session (parametre
+          #     -Auto) : la restauration se fait APRES le demarrage, plus
+          #     pendant le job GitHub Actions ;
+          #   - MANUEL : double-clic sur RestaurerJellyfinMEGA.bat (Bureau)
+          #     pour forcer une restauration / reparation a tout moment.
+          #
+          # Reparation automatique si Jellyfin reste bloque sur
+          # "Jellyfin is still starting... Initializing server" :
+          #   1. demarrage simple ;
+          #   2. reinitialisation de network.xml (bindings d une ancienne VM) ;
+          #   3. verification / reconstruction de jellyfin.db (sqlite) ;
+          #   4. version precedente de la base (historique JellyfinOld,
+          #      ancien format) ;
+          #   5. dernier recours : base neuve, config systeme conservee,
+          #      sauvegardes auto suspendues (JELLYFIN_BASE_PERDUE.txt).
+          #
+          # Ce script ne modifie JAMAIS la sauvegarde sur MEGA (il ne fait que
+          # lire mega-config:). Log : C:\rclone\restaure-jellyfin.log
+          # =====================================================================
+          param([switch]$Auto)
+
+          $ProgressPreference = 'SilentlyContinue'
+          $ErrorActionPreference = 'Continue'
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $rclone      = 'C:\rclone\rclone.exe'
+          $logFile     = 'C:\rclone\restaure-jellyfin.log'
+          $lockFile    = 'C:\rclone\restaure-jellyfin.lock'
+          $flagFile    = 'C:\rclone\jellyfin-restored.flag'
+          $blockFile   = 'C:\rclone\JELLYFIN_BASE_PERDUE.txt'
+          $localRoot   = 'C:\ProgramData\Jellyfin'
+          $serverDir   = "$localRoot\Server"
+          $configDir   = "$serverDir\config"
+          $dataDir     = "$serverDir\data"
+          $service     = 'JellyfinServer'
+          $apiUri      = 'http://localhost:8096/System/Info/Public'
+          $healthUri   = 'http://localhost:8096/health'
+          $zipDest     = 'mega-config:JellyfinBackups'
+          $zipPrefix   = 'jellyfin-backup-'
+          $destServer  = 'mega-config:JellyfinConfig/Server'
+          $history     = 'mega-config:JellyfinOld'
+          $stageDir    = 'C:\rclone\restore-staging'
+          $jfRoot      = 'C:\Program Files\Jellyfin'
+          $env:RCLONE_CONFIG = 'C:\rclone\rclone.conf'
+
+          function Write-Log {
+            param([string]$Message)
+            $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+            Write-Host $line
+            try { Add-Content -Path $logFile -Value $line -Encoding UTF8 } catch { }
+          }
+
+          function Stop-Jellyfin {
+            Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
+            # Un jellyfin.exe "hung" peut survivre a Stop-Service et garder des
+            # verrous SQLite + le port 8096 : on force l arret des processus.
+            Get-Process jellyfin -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          }
+
+          function Test-Jellyfin {
+            # Teste que Jellyfin est VRAIMENT pret : l API publique doit repondre
+            # ET le endpoint /health doit renvoyer 200. Pendant les migrations
+            # SQLite, le port 8096 repond deja mais /health reste en 503 : c est
+            # exactement l etat "Jellyfin is still starting... Initializing
+            # server" que ce script doit detecter comme NON pret.
+            param([int]$Seconds = 120)
+            $deadline = (Get-Date).AddSeconds($Seconds)
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $info = Invoke-RestMethod -Uri $apiUri -TimeoutSec 5
+                if ($info.Version) {
+                  try {
+                    Invoke-WebRequest -Uri $healthUri -UseBasicParsing -TimeoutSec 5 | Out-Null
+                    return $true
+                  } catch {
+                    $code = $null
+                    if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if ($code -eq 404) { return $true }  # /health absent sur vieille version : API OK
+                    # 503 ou autre : serveur encore en initialisation, on continue
+                  }
+                }
+              } catch { }
+              Start-Sleep -Seconds 5
+            }
+            return $false
+          }
+
+          function Test-ZipLisible {
+            # Verifie que l archive ZIP est lisible (entete + repertoires valides).
+            param([string]$Path)
+            try {
+              $z = [IO.Compression.ZipFile]::OpenRead($Path)
+              $n = $z.Entries.Count
+              $z.Dispose()
+              return ($n -gt 0)
+            } catch {
+              return $false
+            }
+          }
+
+          function Show-JellyfinLog {
+            # Affiche la fin du log Jellyfin : indispensable pour voir la vraie
+            # cause d un blocage (base, migration, binding reseau...).
+            $latest = Get-ChildItem "$serverDir\log", "$serverDir\logs" -Filter '*.log' -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($latest) {
+              Write-Log "---------- 30 dernieres lignes de $($latest.FullName) ----------"
+              Get-Content $latest.FullName -Tail 30 | ForEach-Object { Write-Log $_ }
+              Write-Log '---------------------------------------------------------------'
+            } else {
+              Write-Log "Log Jellyfin introuvable dans $serverDir\log."
+            }
+          }
+
+          function Resolve-Python {
+            $py = $null
+            foreach ($c in 'python', 'py') {
+              $cmd = Get-Command $c -ErrorAction SilentlyContinue
+              if ($cmd) { $py = $cmd.Source; break }
+            }
+            if (-not $py) {
+              $py = Get-ChildItem 'C:\hostedtoolcache\windows\Python\*\x64\python.exe' -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+            }
+            return $py
+          }
+
+          function Resolve-JellyfinExe {
+            $exe = Get-ChildItem $jfRoot -Recurse -Filter 'jellyfin.exe' -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($exe) { return $exe.FullName }
+            return $null
+          }
+
+          function Save-Success {
+            New-Item -ItemType File -Path $flagFile -Force | Out-Null
+            Write-Log 'SUCCES : Jellyfin est operationnel sur http://localhost:8096.'
+            Write-Log 'Sauvegardes automatiques activees (flag jellyfin-restored.flag cree).'
+          }
+
+          function Get-MegaZipList {
+            @(& $rclone lsf "$zipDest" --include "$zipPrefix*.zip" --files-only 2>$null |
+              Where-Object { $_ } | ForEach-Object { $_.Trim() } | Sort-Object -Descending)
+          }
+
+          function Restore-FromZip {
+            # Restaure un zip natif Jellyfin via jellyfin.exe --restore-archive.
+            # Retourne $true si Jellyfin redevient operationnel (API + /health).
+            param([string]$ZipName)
+            Write-Log "=== Restauration ZIP natif : $ZipName ==="
+            $exe = Resolve-JellyfinExe
+            if (-not $exe) {
+              Write-Log "ERREUR : jellyfin.exe introuvable sous $jfRoot : restauration zip impossible."
+              return $false
+            }
+            Write-Log ("Version Jellyfin installee : " + (Get-Item $exe).VersionInfo.ProductVersion)
+            New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+            $localZip = Join-Path $stageDir $ZipName
+            # --- Telechargement du zip depuis MEGA (3 essais, integrite verifiee) ---
+            $dlOk = $false
+            foreach ($try in 1..3) {
+              & $rclone copy "$zipDest/$ZipName" "$stageDir" --ignore-times --retries 2 --low-level-retries 10 --log-level ERROR 2>&1 |
+                ForEach-Object { Write-Log ("rclone : " + $_) }
+              if ($LASTEXITCODE -eq 0 -and (Test-Path $localZip) -and (Test-ZipLisible $localZip)) {
+                $dlOk = $true
+                break
+              }
+              Write-Log "Telechargement/integrite essai $try en echec : nouvel essai dans 20 s..."
+              Start-Sleep -Seconds 20
+            }
+            if (-not $dlOk) {
+              Write-Log 'ERREUR : zip non telecharge ou archive illisible apres 3 essais.'
+              return $false
+            }
+            Write-Log ("Zip telecharge : {0} ({1} octets), archive valide." -f $ZipName, (Get-Item $localZip).Length)
+            # --- Diagnostic : version du serveur qui a produit le backup ---
+            # (restaurer un backup avec une version tres differente peut echouer :
+            #  les migrations de base ne sont pas retro-compatibles).
+            try {
+              $z = [IO.Compression.ZipFile]::OpenRead($localZip)
+              $manifest = $z.Entries | Where-Object { $_.Name -eq 'manifest.json' } | Select-Object -First 1
+              if ($manifest) {
+                $sr = New-Object System.IO.StreamReader($manifest.Open())
+                $raw = $sr.ReadToEnd()
+                $sr.Close()
+                if ($raw.Length -gt 300) { $raw = $raw.Substring(0, 300) + ' ...' }
+                Write-Log "manifest.json du backup : $raw"
+              } else {
+                Write-Log 'manifest.json absent du zip (format inattendu).'
+              }
+              $z.Dispose()
+            } catch {
+              Write-Log "manifest.json illisible : $($_.Exception.Message)"
+            }
+            # --- GitHub #17449 : la base doit avoir ete initialisee au moins une
+            #     fois, sinon --restore-archive echoue sur "no such table" ---
+            if (-not (Test-Path "$dataDir\jellyfin.db")) {
+              Write-Log 'jellyfin.db absent : initialisation de la base (demarrage bref du service) avant restauration...'
+              Start-Service -Name $service -ErrorAction SilentlyContinue
+              $null = Test-Jellyfin -Seconds 180
+              Stop-Jellyfin
+            }
+            # --- Restauration OFFICIELLE : jellyfin.exe --restore-archive ---
+            # Le processus restaure le zip PUIS reste en serveur : des que l API
+            # et /health repondent, la restauration est terminee ; on arrete
+            # alors ce processus et on redemarre le service Windows propre.
+            Stop-Jellyfin
+            Write-Log "Lancement : $exe --restore-archive $localZip"
+            $p = Start-Process -FilePath $exe `
+              -ArgumentList @('--restore-archive', "`"$localZip`"") `
+              -PassThru -WindowStyle Hidden `
+              -RedirectStandardOutput "$stageDir\restore-out.log" `
+              -RedirectStandardError "$stageDir\restore-err.log"
+            $cameUp = $false
+            $deadline = (Get-Date).AddMinutes(20)
+            while ((Get-Date) -lt $deadline) {
+              if ($p.HasExited) {
+                Write-Log "Le processus jellyfin.exe s est arrete (code $($p.ExitCode)) : la restauration a echoue."
+                break
+              }
+              try {
+                $info = Invoke-RestMethod -Uri $apiUri -TimeoutSec 5
+                if ($info.Version) {
+                  try {
+                    Invoke-WebRequest -Uri $healthUri -UseBasicParsing -TimeoutSec 5 | Out-Null
+                    $cameUp = $true
+                    break
+                  } catch {
+                    $code = $null
+                    if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                    if ($code -eq 404) { $cameUp = $true; break }
+                  }
+                }
+              } catch { }
+              Start-Sleep -Seconds 10
+            }
+            if (-not $cameUp) {
+              foreach ($f in @("$stageDir\restore-out.log", "$stageDir\restore-err.log")) {
+                if (Test-Path $f) {
+                  Write-Log "---------- fin de $f ----------"
+                  Get-Content $f -Tail 15 -ErrorAction SilentlyContinue | ForEach-Object { Write-Log $_ }
+                }
+              }
+              Show-JellyfinLog
+              Stop-Jellyfin
+              return $false
+            }
+            Write-Log 'Restauration ZIP terminee : le serveur repond. Redemarrage propre en service Windows...'
+            Stop-Jellyfin
+            # Fichiers recree par le processus manuel : on reapplique les ACL
+            # (meme garde-fou que pour les copies rclone).
+            attrib -R "$localRoot\*" /S /D | Out-Null
+            icacls "$localRoot" /grant '*S-1-5-20:(OI)(CI)F' /T /C /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Log "AVERTISSEMENT : reaplication des ACL incomplete (icacls exit $LASTEXITCODE)." }
+            Start-Service -Name $service -ErrorAction SilentlyContinue
+            if (Test-Jellyfin -Seconds 180) { return $true }
+            Write-Log 'Le service ne repart pas proprement apres la restauration ZIP.'
+            Show-JellyfinLog
+            return $false
+          }
+
+          function Restore-LegacyFolders {
+            # Ancien format (v2.x) : copie config/+data/ depuis JellyfinConfig/Server.
+            Write-Log '=== Restauration ancien format (dossiers config/+data/) ==='
+            # --- Retrait d une eventuelle junction (cmd rmdir ne supprime pas la cible) ---
+            if (Test-Path $localRoot) {
+              $item = Get-Item $localRoot -Force
+              if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                Write-Log "Junction detectee sur $localRoot : retrait."
+                cmd /c rmdir "$localRoot" | Out-Null
+              }
+            }
+            New-Item -ItemType Directory -Path $configDir, $dataDir -Force | Out-Null
+            # --- Nettoyage des bases SQLite LOCALES avant restauration ---
+            # Un *.db restaure melange a un journal local (-wal/-shm/-journal)
+            # d une autre base = contenu incoherent = page "Initializing server"
+            # a l infini. On supprime tout avant la copie.
+            Write-Log 'Nettoyage des bases SQLite locales (*.db, -wal, -shm, -journal)...'
+            Remove-Item "$dataDir\*" -Include '*.db', '*.db-wal', '*.db-shm', '*.db-journal' -Force -ErrorAction SilentlyContinue
+            # --- Copie de la sauvegarde MEGA (ecrasement force) ---
+            & $rclone copy "$destServer/config" "$configDir" --ignore-times --retries 3 --low-level-retries 10 --log-level ERROR 2>&1 |
+              ForEach-Object { Write-Log ("rclone : " + $_) }
+            if ($LASTEXITCODE -ne 0) { Write-Log "AVERTISSEMENT : restauration de config incomplete (exit $LASTEXITCODE)." }
+            & $rclone copy "$destServer/data" "$dataDir" --ignore-times --retries 3 --low-level-retries 10 --log-level ERROR 2>&1 |
+              ForEach-Object { Write-Log ("rclone : " + $_) }
+            if ($LASTEXITCODE -ne 0) { Write-Log "AVERTISSEMENT : restauration de data incomplete (exit $LASTEXITCODE)." }
+            # --- Journaux SQLite RESTORES : toujours supprimes apres la copie ---
+            $stale = Get-ChildItem "$dataDir\*" -Include '*.db-wal', '*.db-shm', '*.db-journal' -File -ErrorAction SilentlyContinue
+            foreach ($f in $stale) {
+              Write-Log "Suppression du journal SQLite restaure : $($f.Name)"
+              Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+            }
+            # --- ACL : NETWORK SERVICE doit garder le controle total sur l arbre ---
+            attrib -R "$localRoot\*" /S /D | Out-Null
+            icacls "$localRoot" /grant '*S-1-5-20:(OI)(CI)F' /T /C /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Log "AVERTISSEMENT : reaplication des ACL incomplete (icacls exit $LASTEXITCODE)." }
+            Write-Log "ACL reappliquees : NETWORK SERVICE a le controle total sur $localRoot."
+          }
+
+          # --- Relancement automatique avec droits administrateur (mode manuel) ---
+          $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $isAdmin = (New-Object Security.Principal.WindowsPrincipal($wi)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $isAdmin) {
+            Write-Host 'Droits administrateur requis : relancement eleve dans une nouvelle fenetre...'
+            Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait `
+              -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
+            exit
+          }
+
+          # --- Verrou : une seule restauration a la fois ---
+          $lockRecent = $false
+          if (Test-Path $lockFile) {
+            $ageMin = ((Get-Date) - (Get-Item $lockFile -ErrorAction SilentlyContinue).LastWriteTime).TotalMinutes
+            if ($ageMin -lt 15) { $lockRecent = $true }
+          }
+          if ($lockRecent) {
+            Write-Log 'Une restauration est deja en cours (verrou recent) : arret.'
+            exit 0
+          }
+
+          try {
+            New-Item -ItemType File -Path $lockFile -Force | Out-Null
+
+            # --- En mode auto : ne pas restaurer deux fois sur la meme VM ---
+            if ($Auto -and (Test-Path $flagFile)) {
+              Write-Log 'Restauration deja realisee sur cette VM (flag present) : rien a faire.'
+              Write-Log 'Pour forcer une restauration : double-clic sur RestaurerJellyfinMEGA.bat (Bureau).'
+              exit 0
+            }
+            if ($Auto -and (Test-Path $blockFile)) {
+              Write-Log 'Base recreee a vide precedemment (JELLYFIN_BASE_PERDUE.txt) : restauration auto ignoree.'
+              Write-Log 'Pour retenter : double-clic sur RestaurerJellyfinMEGA.bat (Bureau).'
+              exit 0
+            }
+
+            Write-Log '=== Restauration de la configuration Jellyfin depuis MEGA ==='
+
+            # --- Attente de rclone (le script peut demarrer juste apres le boot) ---
+            foreach ($i in 1..18) {
+              if (Test-Path $rclone) { break }
+              Write-Log "Attente de rclone.exe ($i/18)..."
+              Start-Sleep -Seconds 10
+            }
+            if (-not (Test-Path $rclone)) {
+              Write-Log 'ERREUR : rclone.exe introuvable sur C:\rclone. Abandon.'
+              exit 1
+            }
+
+            # --- Attente de l acces MEGA (reseau pas pret juste apres le boot) ---
+            $megaOk = $false
+            foreach ($i in 1..18) {
+              & $rclone lsf 'mega-config:' --max-depth 1 2>$null | Out-Null
+              if ($LASTEXITCODE -eq 0) { $megaOk = $true; break }
+              Write-Log "MEGA (mega-config) pas encore joignable ($i/18)..."
+              Start-Sleep -Seconds 10
+            }
+            if (-not $megaOk) {
+              Write-Log 'ERREUR : mega-config injoignable apres 3 minutes. Abandon (service Jellyfin non touche).'
+              exit 1
+            }
+
+            # --- Quelle source de restauration est disponible sur MEGA ? ---
+            $megaZips = Get-MegaZipList
+            $listing = & $rclone lsf "$destServer" --max-depth 1 --dirs-only 2>$null
+            $legacyExists = ($LASTEXITCODE -eq 0 -and $listing)
+
+            if (-not $megaZips -and -not $legacyExists) {
+              Write-Log 'Aucune sauvegarde sur MEGA (ni zip natif JellyfinBackups, ni dossiers JellyfinConfig).'
+              Write-Log 'Premiere installation : Jellyfin garde sa configuration neuve (assistant 1er lancement).'
+              New-Item -ItemType File -Path $flagFile -Force | Out-Null
+              Write-Log 'Sauvegardes automatiques autorisees (flag cree).'
+              exit 0
+            }
+            if ($megaZips.Count -gt 0) {
+              Write-Log "Backups natifs disponibles sur MEGA (du plus recent au plus ancien) :"
+              foreach ($zn in ($megaZips | Select-Object -First 5)) { Write-Log "  - $zn" }
+            }
+
+            # --- 1) Source privilegiee : les zips natifs (du plus recent) ---
+            $zipOk = $false
+            foreach ($zn in ($megaZips | Select-Object -First 3)) {
+              if (Restore-FromZip $zn) { $zipOk = $true; break }
+              Write-Log "Le zip $zn n a pas donne un serveur operationnel : essai du suivant."
+            }
+            if ($zipOk) { Save-Success; exit 0 }
+
+            # --- 2) Repli : ancien format de dossiers (si present) ---
+            if ($legacyExists) {
+              if ($megaZips.Count -gt 0) {
+                Write-Log 'Repli : restauration depuis l ancien format (dossiers JellyfinConfig/Server)...'
+              }
+              Restore-LegacyFolders
+              Write-Log 'Restauration ancien format terminee.'
+            }
+
+            # ================= Ladder de reparation =================
+            # Tentative 1 : demarrage simple
+            Write-Log 'Tentative 1 : demarrage de Jellyfin sur la configuration restoree...'
+            Start-Service -Name $service -ErrorAction SilentlyContinue
+            if (Test-Jellyfin -Seconds 120) { Save-Success; exit 0 }
+            Write-Log 'ECHEC : Jellyfin n est pas operationnel apres 2 minutes.'
+            Show-JellyfinLog
+
+            # Tentative 2 : reinitialisation reseau (bindings d une ancienne VM)
+            Write-Log 'Tentative 2 : reinitialisation des parametres reseau (network.xml)...'
+            Stop-Jellyfin
+            $netXml = "$configDir\network.xml"
+            if (Test-Path $netXml) {
+              Copy-Item $netXml "$netXml.avant-restauration" -Force
+              $content = Get-Content $netXml -Raw
+              $content = $content -replace '<BindAddresses>.*?</BindAddresses>', '<BindAddresses></BindAddresses>'
+              $content = $content -replace '<PublishedServerUrl>.*?</PublishedServerUrl>', '<PublishedServerUrl></PublishedServerUrl>'
+              Set-Content -Path $netXml -Value $content -Encoding UTF8
+              Write-Log 'network.xml : BindAddresses et PublishedServerUrl reinitialises (copie : network.xml.avant-restauration).'
+            } else {
+              Write-Log 'network.xml absent : rien a reinitialiser.'
+            }
+            Start-Service -Name $service -ErrorAction SilentlyContinue
+            if (Test-Jellyfin -Seconds 120) { Save-Success; exit 0 }
+            Write-Log 'ECHEC : toujours pas operationnel apres reinitialisation reseau.'
+            Show-JellyfinLog
+
+            # Tentative 3 : verification / reconstruction de la base via sqlite
+            Write-Log 'Tentative 3 : verification et reconstruction eventuelle de jellyfin.db...'
+            Stop-Jellyfin
+            $dbIntact = $false
+            $py = Resolve-Python
+            if ($py) {
+              $recoverLines = @(
+                'import sqlite3, os, sys',
+                'db  = r"C:\ProgramData\Jellyfin\Server\data\jellyfin.db"',
+                'out = r"C:\rclone\db-recover\jellyfin.db"',
+                'os.makedirs(os.path.dirname(out), exist_ok=True)',
+                'if not os.path.exists(db):',
+                '    print("RESULTAT: ABSENT")',
+                '    sys.exit(0)',
+                'try:',
+                '    con = sqlite3.connect(db)',
+                '    row = con.execute("PRAGMA integrity_check").fetchone()',
+                '    con.close()',
+                '    if row and row[0] == "ok":',
+                '        print("RESULTAT: INTACTE")',
+                '        sys.exit(0)',
+                'except Exception as e:',
+                '    print("INTEGRITE-ERREUR:", e)',
+                'try:',
+                '    src = sqlite3.connect(db)',
+                '    new = sqlite3.connect(out)',
+                '    count = 0',
+                '    for stmt in src.iterdump():',
+                '        new.executescript(stmt)',
+                '        count += 1',
+                '    src.close()',
+                '    new.close()',
+                '    print("RESULTAT: RECOVER-OK", count)',
+                'except Exception as e:',
+                '    print("RECOVER-ERREUR:", e)',
+                '    sys.exit(1)'
+              )
+              Set-Content -Path 'C:\rclone\jfrecover.py' -Value $recoverLines -Encoding ASCII
+              $recoverOut = (& $py 'C:\rclone\jfrecover.py' 2>&1 | Out-String)
+              $recoverOut -split "`r?`n" | ForEach-Object { $t = $_.Trim(); if ($t) { Write-Log "python : $t" } }
+              if ($recoverOut -match 'RESULTAT: RECOVER-OK') {
+                $newDb = 'C:\rclone\db-recover\jellyfin.db'
+                if ((Test-Path $newDb) -and ((Get-Item $newDb).Length -gt 4096)) {
+                  Copy-Item $newDb "$dataDir\jellyfin.db" -Force
+                  Write-Log 'Base reconstruite depuis le dump SQL et reinstallee.'
+                }
+              } elseif ($recoverOut -match 'RESULTAT: INTACTE') {
+                $dbIntact = $true
+                Write-Log 'jellyfin.db est integre : le blocage vient d ailleurs (reseau ou service).'
+              }
+            } else {
+              Write-Log 'Python introuvable : reconstruction impossible, tentative suivante.'
+            }
+            Start-Service -Name $service -ErrorAction SilentlyContinue
+            if (Test-Jellyfin -Seconds 120) { Save-Success; exit 0 }
+            Write-Log 'ECHEC : toujours pas operationnel apres verification de la base.'
+            Show-JellyfinLog
+
+            # Tentative 4 : version precedente de la base (historique JellyfinOld)
+            if ($dbIntact) {
+              Write-Log 'Base integre : on passe directement au dernier recours (base neuve).'
+            } else {
+              Write-Log "Tentative 4 : versions precedentes de la base ($history, ancien format)..."
+              $oldDirs = @(& $rclone lsf "$history" --max-depth 1 --dirs-only 2>$null) |
+                Where-Object { $_ } | Sort-Object -Descending
+              $restoredOld = $false
+              foreach ($od in $oldDirs) {
+                $odName = $od.TrimEnd('/')
+                Write-Log "Essai de la sauvegarde historique : $odName"
+                Stop-Jellyfin
+                & $rclone copy "$history/$odName/data" "$dataDir" --include '*.db' --ignore-times --retries 2 --low-level-retries 10 --log-level ERROR 2>&1 |
+                  ForEach-Object { Write-Log ("rclone : " + $_) }
+                Get-ChildItem "$dataDir\*" -Include '*.db-wal', '*.db-shm', '*.db-journal' -File -ErrorAction SilentlyContinue |
+                  ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                Start-Service -Name $service -ErrorAction SilentlyContinue
+                if (Test-Jellyfin -Seconds 120) { $restoredOld = $true; break }
+                Write-Log "La sauvegarde $odName ne demarre pas non plus."
+              }
+              if ($restoredOld) { Save-Success; exit 0 }
+              if (-not $oldDirs) { Write-Log 'Aucun historique disponible sur MEGA (dossier JellyfinOld).' }
+              else { Show-JellyfinLog }
+            }
+
+            # Tentative 5 (dernier recours) : base neuve, config systeme conservee
+            Write-Log 'Tentative 5 (dernier recours) : base neuve, configuration systeme conservee...'
+            Stop-Jellyfin
+            New-Item -ItemType Directory -Path 'C:\rclone\db-quarantine' -Force | Out-Null
+            Copy-Item "$dataDir\*" -Destination 'C:\rclone\db-quarantine\' -Force -ErrorAction SilentlyContinue
+            Write-Log 'Bases mises en quarantaine dans C:\rclone\db-quarantine.'
+            Remove-Item "$dataDir\*" -Include '*.db', '*.db-wal', '*.db-shm', '*.db-journal' -Force -ErrorAction SilentlyContinue
+            # Sans ce rearmement, Jellyfin demarrerait sans assistant et sans aucun
+            # utilisateur connu : login impossible apres une base neuve.
+            $sysXml = "$configDir\system.xml"
+            if (Test-Path $sysXml) {
+              $content = Get-Content $sysXml -Raw
+              $content = $content -replace '<IsStartupWizardCompleted>true</IsStartupWizardCompleted>', '<IsStartupWizardCompleted>false</IsStartupWizardCompleted>'
+              Set-Content -Path $sysXml -Value $content -Encoding UTF8
+              Write-Log 'system.xml : assistant de premier lancement rearme.'
+            }
+            Start-Service -Name $service -ErrorAction SilentlyContinue
+            if (Test-Jellyfin -Seconds 180) {
+              Write-Log 'SUCCES PARTIEL : Jellyfin demarre avec une base NEUVE.'
+              Write-Log 'ATTENTION : comptes utilisateurs et bibliotheques sont a recreeer via http://localhost:8096 (assistant).'
+              Write-Log 'La base precedente est conservee dans C:\rclone\db-quarantine (recuperation possible).'
+              Set-Content -Path $blockFile `
+                -Value 'Base Jellyfin recreee a vide (voir C:\rclone\restaure-jellyfin.log). Sauvegardes auto suspendues pour proteger la sauvegarde MEGA. Supprimez ce fichier une fois Jellyfin reconfigure pour reactiver les sauvegardes.' `
+                -Encoding ASCII
+              Write-Log 'Sauvegardes automatiques SUSPENDUES (JELLYFIN_BASE_PERDUE.txt) pour ne pas ecraser la bonne sauvegarde MEGA.'
+              Write-Log 'Une fois Jellyfin reconfigure : supprimez C:\rclone\JELLYFIN_BASE_PERDUE.txt pour reactiver.'
+              exit 2
+            }
+            Write-Log 'ERREUR : Jellyfin ne repond toujours pas, meme avec une base neuve.'
+            Show-JellyfinLog
+            Write-Log 'A verifier : Get-Service JellyfinServer et C:\ProgramData\Jellyfin\Server\log\jellyfin_latest.log'
+            exit 1
+          }
+          finally {
+            Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+          }
+          '@
+          # Fin de ligne CRLF (compatibilite maximale PowerShell 5.1)
+          Set-Content -Path 'C:\rclone\RestaurerJellyfinMEGA.ps1' `
+            -Value ($restorePs1 -replace "`r", '' -replace "`n", "`r`n") -Encoding ASCII
+
+          # ---------- 2) RestaurerJellyfinMEGA.bat (lanceur double-clic Bureau) ----------
+          $restoreBat = @'
+          @echo off
+          title Restauration Jellyfin depuis MEGA
+          echo ================================================================
+          echo  RESTAURATION DE LA CONFIGURATION JELLYFIN DEPUIS MEGA
+          echo.
+          echo  - arrete Jellyfin, restaure la derniere sauvegarde mega-config:
+          echo  - redemarre Jellyfin avec reparation automatique si blocage
+          echo    ("Jellyfin is still starting...")
+          echo  - ce script restaure seulement : la sauvegarde sur MEGA
+          echo    n est pas modifiee
+          echo  - attention : les changements locaux non encore sauvegardes
+          echo    (10 dernieres minutes maxi) sont remplaces par la sauvegarde
+          echo ================================================================
+          echo.
+
+          rem Relancement automatique avec droits administrateur si necessaire
+          net session >nul 2>&1
+          if %errorlevel% neq 0 (
+            echo Relancement avec droits administrateur...
+            powershell -NoProfile -Command "Start-Process -FilePath '%COMSPEC%' -ArgumentList '/c','\"%~f0\"' -Verb RunAs"
+            exit /b
+          )
+
+          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0RestaurerJellyfinMEGA.ps1"
+          echo.
+          echo Log complet : C:\rclone\restaure-jellyfin.log
+          pause
+          '@
+          Set-Content -Path 'C:\rclone\RestaurerJellyfinMEGA.bat' `
+            -Value ($restoreBat -replace "`r", '' -replace "`n", "`r`n") -Encoding ASCII
+
+          # ---------- 3) jellyfin-sync.ps1 (televersement du dernier backup natif Jellyfin) ----------
+          $syncPs1 = @'
+          # =====================================================================
+          # jellyfin-sync.ps1  (VERSION 3.0 - 2026-11-17)
+          # Televersement du DERNIER backup NATIF Jellyfin vers MEGA
+          # (remote mega-config:JellyfinBackups).
+          # Execute par la tache planifiee SYSTEM "JellyfinConfigBackup"
+          # (toutes les heures). Log : C:\rclone\jellyfin-sync.log
+          #
+          # Nouvelle strategie (v3.0) :
+          #   Jellyfin 10.11+ possede un systeme de sauvegarde integre
+          #   (Dashboard -> Backups -> Create Backup) qui ecrit un ZIP COHERENT
+          #   dans C:\ProgramData\Jellyfin\Server\data\backups, nom du type
+          #   jellyfin-backup-20261116214340.zip. Ce script televerse le DERNIER
+          #   de ces zips vers MEGA. La copie brute config/+data/ et les
+          #   snapshots SQLite (jfdbbackup.py, historique JellyfinOld) sont
+          #   ABANDONNES : le zip natif est deja coherent (produit par Jellyfin
+          #   lui-meme) et se restaure officiellement par
+          #   jellyfin.exe --restore-archive (voir RestaurerJellyfinMEGA.ps1).
+          #
+          # Principes :
+          #   1. Un seul fichier par cycle : le dernier jellyfin-backup-*.zip
+          #      (tri par nom = horodatage). Si aucun NOUVEAU zip depuis le
+          #      dernier televersement (fichier d etat
+          #      C:\rclone\jellyfin-sync-uploaded.txt), le cycle se termine sans
+          #      rien faire. Creer un backup : Dashboard Jellyfin -> Backups ->
+          #      Create Backup (ou plugin "Auto Backup" pour planifier).
+          #   2. Garde anti-ecrasement : televersement autorise SEULEMENT si la
+          #      restauration depuis MEGA a reussi au moins une fois (flag
+          #      C:\rclone\jellyfin-restored.flag) OU premiere installation
+          #      detectee (aucun zip sur MEGA + Jellyfin operationnel + assistant
+          #      de 1er lancement termine). Sauvegardes suspendues tant que
+          #      C:\rclone\JELLYFIN_BASE_PERDUE.txt existe.
+          #   3. Securite : zip ignore s il a moins de 2 minutes (creation en
+          #      cours par Jellyfin) ou si l archive est illisible
+          #      (System.IO.Compression, retest apres 30 s).
+          #   4. MEGA ne supporte NI modtime NI hash (docs rclone) => la preuve
+          #      d upload est la comparaison de TAILLE apres televersement.
+          #   5. Retention : les $keepOnMega derniers zips restent sur MEGA, les
+          #      plus anciens sont purges a chaque cycle.
+          # =====================================================================
+
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference    = 'SilentlyContinue'
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $rclone      = 'C:\rclone\rclone.exe'
+          $conf        = 'C:\rclone\rclone.conf'
+          $log         = 'C:\rclone\jellyfin-sync.log'
+          $flagFile    = 'C:\rclone\jellyfin-restored.flag'
+          $blockFile   = 'C:\rclone\JELLYFIN_BASE_PERDUE.txt'
+          $restoreLock = 'C:\rclone\restaure-jellyfin.lock'
+          $stateFile   = 'C:\rclone\jellyfin-sync-uploaded.txt'
+          $localConfig = 'C:\ProgramData\Jellyfin\Server\config'
+          $bkDir       = 'C:\ProgramData\Jellyfin\Server\data\backups'
+          $dest        = 'mega-config:JellyfinBackups'
+          $zipPrefix   = 'jellyfin-backup-'
+          $keepOnMega  = 3
+          $minAgeSec   = 120
+          $apiUri      = 'http://localhost:8096/System/Info/Public'
+          $healthUri   = 'http://localhost:8096/health'
+          $env:RCLONE_CONFIG = 'C:\rclone\rclone.conf'
+
+          function Write-Log {
+            # Ecrit dans le log ET a l ecran (visible si lancement manuel).
+            param([string]$Message)
+            $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+            Write-Host $line
+            try { Add-Content -Path $log -Value $line -Encoding UTF8 } catch { }
+          }
+
+          function Test-ZipLisible {
+            # Verifie que l archive ZIP est lisible (entete + repertoires valides).
+            param([string]$Path)
+            try {
+              $z = [IO.Compression.ZipFile]::OpenRead($Path)
+              $n = $z.Entries.Count
+              $z.Dispose()
+              return ($n -gt 0)
+            } catch {
+              return $false
+            }
+          }
+
+          # ---------- 0) Pre-vol : rclone, config, Jellyfin, acces MEGA ----------
+          if (-not (Test-Path $rclone)) {
+            Write-Log 'ERREUR : rclone.exe introuvable sur C:\rclone (workflow pas execute sur cette VM ?).'
+            exit 1
+          }
+          if (-not (Test-Path $conf)) {
+            Write-Log "ERREUR : rclone.conf introuvable ($conf) : les remotes MEGA ne sont pas configures."
+            exit 1
+          }
+          if (-not (Test-Path $localConfig)) {
+            Write-Log "ERREUR : $localConfig absent : Jellyfin n est pas installe."
+            exit 1
+          }
+          $megaOk = $false
+          foreach ($i in 1..3) {
+            & $rclone lsf 'mega-config:' --max-depth 1 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $megaOk = $true; break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $megaOk) {
+            Write-Log 'ERREUR : mega-config: injoignable apres 30 s (identifiants, 2FA activee ou reseau).'
+            Write-Log 'Test manuel dans la VM : C:\rclone\rclone.exe lsf mega-config:'
+            exit 1
+          }
+
+          Write-Log 'Cycle de sauvegarde Jellyfin vers MEGA (script v3.0, backup natif ZIP).'
+
+          # ---------- 1) Une restauration est-elle en cours ? ----------
+          if (Test-Path $restoreLock) {
+            $ageMin = 999
+            try { $ageMin = ((Get-Date) - (Get-Item $restoreLock -ErrorAction Stop).LastWriteTime).TotalMinutes } catch { }
+            if ($ageMin -lt 20) {
+              Write-Log 'Restauration Jellyfin en cours (verrou recent) : cycle saute.'
+              exit 0
+            }
+          }
+
+          # ---------- 2) Garde anti-ecrasement de la sauvegarde MEGA ----------
+          if (Test-Path $blockFile) {
+            Write-Log 'Sauvegarde SUSPENDUE : base Jellyfin recreee a vide (JELLYFIN_BASE_PERDUE.txt present).'
+            Write-Log 'Reactiver : supprimez C:\rclone\JELLYFIN_BASE_PERDUE.txt une fois Jellyfin reconfigure.'
+            exit 0
+          }
+
+          $hasFlag = Test-Path $flagFile
+          if (-not $hasFlag) {
+            # Flag absent : des backups natifs existent-ils deja sur MEGA ?
+            $megaZips = @(& $rclone lsf "$dest" --include "$zipPrefix*.zip" --files-only 2>$null | Where-Object { $_ })
+            if ($LASTEXITCODE -eq 0 -and $megaZips.Count -gt 0) {
+              Write-Log 'Sauvegarde bloquee : des backups natifs existent DEJA sur MEGA mais le flag de restauration est absent.'
+              Write-Log '=> La restauration n a pas abouti (ou n a pas encore tourne) : on protege la sauvegarde MEGA.'
+              Write-Log 'Solution normale : double-clic sur RestaurerJellyfinMEGA.bat (Bureau) => restaure puis active les sauvegardes.'
+              Write-Log 'Si vous etes SUR que la config locale est la bonne : creez le fichier C:\rclone\jellyfin-restored.flag.'
+              exit 0
+            }
+            # Premiere installation possible ? (aucun backup natif sur MEGA)
+            $healthy = $false
+            try {
+              $info = Invoke-RestMethod -Uri $apiUri -TimeoutSec 5
+              if ($info.Version) {
+                try {
+                  Invoke-WebRequest -Uri $healthUri -UseBasicParsing -TimeoutSec 5 | Out-Null
+                  $healthy = $true
+                } catch {
+                  $code = $null
+                  if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                  if ($code -eq 404) { $healthy = $true }  # /health absent : vieille version, API OK
+                }
+              }
+            } catch { }
+            # L assistant de 1er lancement est-il termine ? (sinon config vide = rien d utile)
+            $wizardDone = $false
+            $sysXml = Join-Path $localConfig 'system.xml'
+            if (Test-Path $sysXml) {
+              $raw = Get-Content $sysXml -Raw -ErrorAction SilentlyContinue
+              $wizardDone = ($raw -match '<IsStartupWizardCompleted>true</IsStartupWizardCompleted>')
+            }
+            if ($healthy -and $wizardDone) {
+              New-Item -ItemType File -Path $flagFile -Force | Out-Null
+              Write-Log 'Premiere installation detectee (aucun backup sur MEGA, Jellyfin operationnel, assistant termine).'
+              Write-Log 'Flag de sauvegarde cree automatiquement : les cycles suivants sont autorises.'
+              $hasFlag = $true
+            } elseif (-not $healthy) {
+              Write-Log 'Sauvegarde bloquee : Jellyfin ne repond pas sur le port 8096 et aucun backup n existe sur MEGA.'
+              Write-Log 'Le flag sera cree des que Jellyfin sera operationnel (http://localhost:8096).'
+              exit 0
+            } else {
+              Write-Log 'Sauvegarde bloquee : assistant de 1er lancement Jellyfin non termine (config vide).'
+              Write-Log 'Terminez l assistant http://localhost:8096 : la sauvegarde demarrera au cycle suivant.'
+              exit 0
+            }
+          }
+
+          # ---------- 3) Dernier backup natif local ----------
+          if (-not (Test-Path $bkDir)) {
+            Write-Log "AVERTISSEMENT : dossier des backups natifs absent ($bkDir)."
+            Write-Log 'Jellyfin est installe mais AUCUN backup natif n a encore ete cree.'
+            Write-Log 'Creer un backup : Dashboard Jellyfin -> Backups -> Create Backup.'
+            Write-Log 'Le zip sera televerse automatiquement au prochain cycle (max 1 h).'
+            exit 0
+          }
+          $zips = @(Get-ChildItem $bkDir -Filter "$zipPrefix*.zip" -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending)
+          if ($zips.Count -eq 0) {
+            Write-Log "AVERTISSEMENT : aucun jellyfin-backup-*.zip dans $bkDir."
+            Write-Log 'Creer un backup : Dashboard Jellyfin -> Backups -> Create Backup.'
+            Write-Log 'Le zip sera televerse automatiquement au prochain cycle (max 1 h).'
+            exit 0
+          }
+          $latest = $zips[0]
+
+          # Zip trop recent = probablement encore en cours d ecriture par Jellyfin
+          $ageSec = ((Get-Date) - $latest.LastWriteTime).TotalSeconds
+          if ($ageSec -lt $minAgeSec) {
+            Write-Log ("Backup trop recent ({0} s) : creation probablement en cours, cycle saute." -f [int]$ageSec)
+            exit 0
+          }
+          if (-not (Test-ZipLisible $latest.FullName)) {
+            Write-Log 'Archive illisible : retest dans 30 s (ecriture en cours ?)...'
+            Start-Sleep -Seconds 30
+            if (-not (Test-ZipLisible $latest.FullName)) {
+              Write-Log "ERREUR : $($latest.Name) reste illisible (zip corrompu ?) : rien n est televerse ce cycle."
+              exit 1
+            }
+          }
+
+          # ---------- 4) Deja televerse ? (fichier d etat) ----------
+          $lastUploaded = ''
+          if (Test-Path $stateFile) {
+            $lastUploaded = (Get-Content $stateFile -Raw -ErrorAction SilentlyContinue)
+            if ($lastUploaded) { $lastUploaded = $lastUploaded.Trim() }
+          }
+          if ($lastUploaded -eq $latest.Name) {
+            Write-Log "Deja televerse : $($latest.Name) (aucun nouveau backup natif). Fin du cycle."
+            exit 0
+          }
+
+          # ---------- 5) Televersement du dernier zip ----------
+          Write-Log ("Nouveau backup natif : {0} ({1} Mo, cree {2})." -f `
+            $latest.Name, [math]::Round($latest.Length / 1MB, 1), $latest.LastWriteTime)
+          $uploadOk = $false
+          foreach ($try in 1..3) {
+            & $rclone copyto $latest.FullName "$dest/$($latest.Name)" --ignore-times --retries 2 --low-level-retries 10 --log-level ERROR 2>&1 |
+              ForEach-Object { Write-Log ("rclone : " + $_) }
+            if ($LASTEXITCODE -eq 0) { $uploadOk = $true; break }
+            Write-Log "Tentative $try echouee : nouvel essai dans 15 s..."
+            Start-Sleep -Seconds 15
+          }
+          if (-not $uploadOk) {
+            Write-Log 'ERREUR : televersement impossible apres 3 essais.'
+            Write-Log 'Pistes : quota MEGA plein (purgez mega-config:JellyfinBackups), reseau, identifiants.'
+            exit 1
+          }
+
+          # ---------- 6) PREUVE : taille identique sur MEGA ----------
+          # MEGA n expose ni modtime ni hash fiable : la taille est l element de
+          # verification disponible. Le nom du zip contient deja l horodatage.
+          $sizeLocal = $latest.Length
+          $sizeMega  = -1
+          $lsl = @(& $rclone lsl "$dest/$($latest.Name)" 2>$null)
+          if ($lsl.Count -gt 0 -and $lsl[0] -match '^\s*(\d+)\s') { $sizeMega = [long]$Matches[1] }
+          if ($sizeMega -eq $sizeLocal) {
+            Write-Log "PREUVE : $($latest.Name) present sur MEGA ($sizeLocal octets, taille identique)."
+          } else {
+            Write-Log "AVERTISSEMENT : taille sur MEGA ($sizeMega) differente de la taille locale ($sizeLocal) : verifiez les erreurs rclone ci-dessus."
+          }
+
+          # ---------- 7) Retention : garder les $keepOnMega derniers zips sur MEGA ----------
+          $megaList = @(& $rclone lsf "$dest" --include "$zipPrefix*.zip" --files-only 2>$null |
+            Where-Object { $_ } | ForEach-Object { $_.Trim() } | Sort-Object -Descending)
+          if ($megaList.Count -gt $keepOnMega) {
+            foreach ($old in ($megaList | Select-Object -Skip $keepOnMega)) {
+              if ($old -eq $latest.Name) { continue }
+              Write-Log "Purge retention MEGA : $old (limite : $keepOnMega zips)."
+              & $rclone deletefile "$dest/$old" --log-level ERROR 2>&1 |
+                ForEach-Object { Write-Log ("rclone : " + $_) }
+            }
+          }
+
+          # ---------- 8) Etat + resume final ----------
+          Set-Content -Path $stateFile -Value $latest.Name -Encoding ASCII
+          Write-Log 'Zips actuellement sur MEGA (taille + heure du dernier upload) :'
+          & $rclone lsl "$dest" --include "$zipPrefix*.zip" 2>$null |
+            ForEach-Object { if ($_) { Write-Log ("  " + $_) } }
+          Write-Log "Fin du cycle : dernier backup natif televerse = $($latest.Name)."
+          '@
+          Set-Content -Path 'C:\rclone\jellyfin-sync.ps1' `
+            -Value ($syncPs1 -replace "`r", '' -replace "`n", "`r`n") -Encoding ASCII
+          Write-Host 'Scripts Jellyfin deployes : C:\rclone\RestaurerJellyfinMEGA.ps1/.bat + jellyfin-sync.ps1'
+
+          # ---------- 4) Copie sur le Bureau public (visible en session RDP) ----------
+          $publicDesktop = 'C:\Users\Public\Desktop'
+          New-Item -ItemType Directory -Path $publicDesktop -Force | Out-Null
+          Copy-Item 'C:\rclone\RestaurerJellyfinMEGA.bat' $publicDesktop -Force
+          Copy-Item 'C:\rclone\RestaurerJellyfinMEGA.ps1' $publicDesktop -Force
+          Write-Host 'RestaurerJellyfinMEGA.bat copie sur le Bureau (double-clic pour forcer une restauration).'
+
+          # ---------- 5) Tache planifiee SYSTEM : sauvegarde toutes les heures ----------
+          # (Televerse le DERNIER backup natif Jellyfin : zip
+          #  jellyfin-backup-*.zip de C:\ProgramData\Jellyfin\Server\data\backups
+          #  cree via Dashboard -> Backups, vers mega-config:JellyfinBackups.
+          #  La sauvegarde ne s execute QUE si la restauration depuis MEGA a
+          #  reussi au moins une fois : une config neuve ne peut pas ecraser MEGA.)
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+          # ExecutionTimeLimit 120 min : un gros zip (subtitles/trickplay) peut
+          # mettre longtemps a partir vers MEGA ; MultipleInstances IgnoreNew
+          # evite les chevauchements de cycles.
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 120) -StartWhenAvailable
+          $actionSync = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\rclone\jellyfin-sync.ps1'
+          # ATTENTION : RepetitionDuration ([TimeSpan]::MaxValue) est REFUSE par le
+          # Planificateur ("Duration:P99999999DT23H59M59S" hors plage). Duree FINIE :
+          foreach ($days in 3650, 1) {
+            try {
+              $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days $days)
+              Register-ScheduledTask -TaskName 'JellyfinConfigBackup' -Action $actionSync -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+              Write-Host "Tache planifiee 'JellyfinConfigBackup' mise a jour : televersement du dernier backup natif toutes les heures (pendant $days jours)."
+              break
+            } catch {
+              Write-Host "AVERTISSEMENT : tache de sauvegarde impossible (duree $days jours) : $($_.Exception.Message)"
+            }
+          }
+
+          # ---------- 6) Tache planifiee SYSTEM : restauration AU DEMARRAGE DE WINDOWS ----------
+          # La restauration n est JAMAIS lancee pendant le job GitHub : elle
+          # se declenche seule, hors job, 2 min apres le boot de la VM
+          # (AtStartup) ou 1 min apres une ouverture de session du compte RDP
+          # (AtLogOn). ExecutionTimeLimit 180 min : le telechargement des zips
+          # + l echelle de reparation peuvent etre longs.
+          $actionRestore = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\rclone\RestaurerJellyfinMEGA.ps1 -Auto'
+          $triggerBoot = New-ScheduledTaskTrigger -AtStartup
+          $triggerBoot.Delay = 'PT2M'
+          $triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User 'RDP'
+          $triggerLogon.Delay = 'PT1M'
+          $settingsRestore = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 180) -StartWhenAvailable
+          $restoreTaskOk = $false
+          try {
+            Register-ScheduledTask -TaskName 'RestaurationJellyfinMEGA' -Action $actionRestore -Trigger @($triggerBoot, $triggerLogon) -Principal $principal -Settings $settingsRestore -Force -ErrorAction Stop | Out-Null
+            $restoreTaskOk = $true
+            Write-Host "Tache planifiee 'RestaurationJellyfinMEGA' creee : restauration automatique au demarrage de Windows et a l ouverture de session RDP (jamais pendant le job GitHub)."
+          } catch {
+            Write-Host "AVERTISSEMENT : tache de restauration non creee : $($_.Exception.Message)"
+          }
+
+          # ---------- 7) AUCUNE restauration ni attente pendant le job GitHub ----------
+          # Avant, ce step lancait la tache de restauration puis surveillait son
+          # resultat dans une boucle d attente de 25 minutes maximum : c est ce
+          # qui faisait trainer ce step plus de 8 minutes. Ce n est plus le cas :
+          # le step se termine ici en quelques secondes. La restauration est
+          # assuree EXCLUSIVEMENT par la tache planifiee SYSTEM
+          # RestaurationJellyfinMEGA, hors job GitHub :
+          #   - 2 min apres chaque demarrage de Windows (declencheur AtStartup) ;
+          #   - 1 min apres chaque ouverture de session du compte RDP
+          #     (declencheur AtLogOn) : la premiere connexion RDP sur la VM
+          #     lance donc la restauration, sans besoin de reboot.
+          Write-Host ''
+          Write-Host 'Restauration Jellyfin : PROGRAMMEE (tache planifiee SYSTEM RestaurationJellyfinMEGA).'
+          Write-Host '  Elle n est PAS lancee pendant le job GitHub ; elle demarrera automatiquement :'
+          Write-Host '    - 2 min apres le prochain demarrage de Windows (AtStartup) ;'
+          Write-Host '    - 1 min apres la prochaine ouverture de session RDP (AtLogOn, compte RDP).'
+          Write-Host '  Suivre en direct (session RDP) : Get-Content C:\rclone\restaure-jellyfin.log -Tail 50 -Wait'
+          Write-Host '  Forcer manuellement : double-clic sur RestaurerJellyfinMEGA.bat (Bureau).'
+          Write-Host '  Cycles de sauvegarde horaire proteges : sautes si une restauration est'
+          Write-Host '  en cours (verrou recent) ou si le flag de restauration est absent.'
+          if (-not $restoreTaskOk) {
+            # Filet de securite : tache planifiee impossible -> script lance en
+            # arriere-plan SANS attente (Start-Process sans -Wait : le step ne
+            # bloque pas).
+            Write-Host 'AVERTISSEMENT : tache planifiee indisponible : restauration lancee en arriere-plan (sans attente).'
+            Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\rclone\RestaurerJellyfinMEGA.ps1', '-Auto'
+          }
+      # ================================================================
+      # NOUVEAU : cloudflared (tunnel public pour Jellyfin)
+      # ================================================================
+      - name: Install cloudflared
+        run: |
+          New-Item -ItemType Directory -Path "C:\cloudflared" -Force | Out-Null
+          $exe = "C:\cloudflared\cloudflared.exe"
+          # Asset a nom stable -> lien "latest" officiel Cloudflare
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $exe
+          # Ajoute C:\cloudflared au PATH machine (utile dans la session RDP aussi)
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($machinePath -notlike "*C:\cloudflared*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;C:\cloudflared", "Machine")
+          }
+          $env:Path += ";C:\cloudflared"
+          Write-Host "cloudflared installe : $(& $exe version | Select-Object -First 1)"
+          Write-Host "Le tunnel TryCloudflare sera lance a l'ouverture de session RDP (URL aleatoire)."
+      - name: Install latest Tailscale
+        run: |
+          # Detecte automatiquement la derniere version stable (plus de version epinglee)
+          $msiName = (Invoke-RestMethod "https://pkgs.tailscale.com/stable/?mode=json").MSIs.amd64
+          Write-Host "Tailscale detecte : $msiName"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/$msiName" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+      - name: Connect to Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          # Cle d'auth EPHEMERE recommandee : la machine disparait du tailnet
+          # a la fin du job (admin console > Settings > Keys)
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$Env:TAILSCALE_AUTHKEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # avec exitNode & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$Env:TAILSCALE_AUTHKEY --hostname=gh-runner-$env:GITHUB_RUN_ID --advertise-exit-node
+          $tsIP = $null
+          foreach ($i in 1..20) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 5
+          }
+          if (-not $tsIP) {
+              Write-Error "IP Tailscale non attribuee. Verifiez le secret TAILSCALE_AUTHKEY."
+              exit 1
+          }
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$tsIP"
+      - name: Verify RDP accessibility
+        run: |
+          Write-Host "============================================"
+          Write-Host " IP Tailscale      : $env:TAILSCALE_IP"
+          Write-Host " Utilisateur       : RDP"
+          Write-Host " Mot de passe      : voir le secret RDP_PASSWORD"
+          Write-Host " Jellyfin (web)    : http://$env:TAILSCALE_IP:8096"
+          Write-Host " Config Jellyfin   : locale (C:\ProgramData\Jellyfin) ; restauration MEGA au demarrage de Windows (tache RestaurationJellyfinMEGA)"
+          Write-Host " Sauvegarde MEGA   : dernier backup natif ZIP (Dashboard -> Backups) televerse toutes les heures (tache JellyfinConfigBackup), seulement apres une restauration reussie"
+          Write-Host " Restauration manuelle : double-clic sur RestaurerJellyfinMEGA.bat (Bureau) ; log : C:\rclone\restaure-jellyfin.log"
+          Write-Host " NB lecteur J:     : n'existe plus (voulu) : le compte MEGA dedie sert uniquement de sauvegarde"
+          Write-Host " MEGA (rclone)     : disque combine unique monte sur M: = \\rclone\mega a l'ouverture de session"
+          Write-Host " MEGAsync          : login a faire dans l'assistant a la 1re connexion"
+          Write-Host " Ajout compte MEGA : double-cliquez AjouterCompteMEGA.bat sur le Bureau (session RDP)"
+          Write-Host "============================================"
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+              Write-Error "Port 3389 inaccessible via Tailscale"
+              exit 1
+          }
+          Write-Host "Port 3389 joignable via Tailscale."
+      - name: Install startup script (depuis le depot, pas de telechargement externe)
+        env:
+          # OPTIONNEL : push de l'URL Cloudflare vers Google Drive.
+          #   GOOGLE_SCRIPT_URL   = URL /exec de l'application Web Apps Script
+          #                         (voir apps-script/Code.gs dans le README)
+          #   GDRIVE_PUSH_SECRET  = meme valeur que SECRET dans Code.gs
+          # Si vides : l'envoi est simplement desactive, aucune erreur.
+          GOOGLE_SCRIPT_URL: ${{ secrets.GOOGLE_SCRIPT_URL }}
+          GDRIVE_PUSH_SECRET: ${{ secrets.GDRIVE_PUSH_SECRET }}
+        run: |
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          # Le profil n'existe qu'apres la 1re connexion RDP
+          while (-not (Test-Path $rdpProfile)) {
+              Write-Host "[$(Get-Date)] Attente de la premiere connexion RDP..."
+              Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path $startupPath)) {
+              New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+          }
+          # COPIE SEULEMENT : Downloads.bat s'executera a l'ouverture de session RDP.
+          # (Ne plus l'executer ici : tout ce qui est machine-wide est deja installe
+          #  par les etapes du workflow, et une execution sous le compte runner
+          #  installerait NDM dans le mauvais profil et ouvrirait le montage rclone
+          #  hors de la session RDP.)
+          Copy-Item -Path ".\scripts\Downloads.bat" -Destination "$startupPath\Downloads.bat" -Force
+          # Copie aussi sur le Bureau : a la 1re connexion la session est deja
+          # ouverte, l'utilisateur peut donc double-cliquer dessus immediatement
+          Copy-Item -Path ".\scripts\Downloads.bat" -Destination "$rdpProfile\Desktop\Downloads.bat" -Force -ErrorAction SilentlyContinue
+          # Outil manuel : ajout d'un compte MEGA au disque combine M:
+          # (scripts/AjouterCompteMEGA.bat + .ps1 dans le depot ; si absents,
+          #  simple avertissement, le job continue sans l'outil)
+          foreach ($f in "AjouterCompteMEGA.bat", "AjouterCompteMEGA.ps1") {
+            if (Test-Path ".\scripts\$f") {
+              Copy-Item ".\scripts\$f" -Destination "$rdpProfile\Desktop\" -Force
+              Write-Host "$f copie sur le Bureau."
+            } else {
+              Write-Host "AVERTISSEMENT : .\scripts\$f absent du depot, outil d'ajout MEGA non installe."
+            }
+          }
+          # RunOnce : garantit l'execution au prochain login si la session
+          # actuelle a demarre avant la copie dans le dossier Demarrage
+          $runOnceCmd = "cmd /c `"$startupPath\Downloads.bat`""
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" `
+            -Name "DownloadsBat" -Value $runOnceCmd -PropertyType String -Force | Out-Null
+          Write-Host "Downloads.bat installe (Demarrage + Bureau + RunOnce)."
+          # ---------- Push Google Drive de l'URL Cloudflare ----------
+          # Copie l'expediteur dans C:\rclone et ecrit la config lue par
+          # push_url_gdrive.ps1 (appele par Downloads.bat apres chaque
+          # generation d'une nouvelle URL tunnel). L'URL atterrit dans
+          # un fichier URL-Jellyfin.txt du Drive via l'application Web
+          # Apps Script (apps-script/Code.gs).
+          Copy-Item ".\scripts\push_url_gdrive.ps1" -Destination "C:\rclone\" -Force
+          if ($Env:GOOGLE_SCRIPT_URL -and $Env:GDRIVE_PUSH_SECRET) {
+            @{ scriptUrl = $Env:GOOGLE_SCRIPT_URL; secret = $Env:GDRIVE_PUSH_SECRET } |
+              ConvertTo-Json | Set-Content "C:\rclone\gdrive-push.json" -Encoding ASCII
+            Write-Host "Push Google Drive configure : C:\rclone\gdrive-push.json"
+          } else {
+            Write-Host "Secrets GOOGLE_SCRIPT_URL / GDRIVE_PUSH_SECRET vides : push Google Drive desactive."
+          }
+      - name: Keep session alive
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP actif sur $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 900
+          }
